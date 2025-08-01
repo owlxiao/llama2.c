@@ -39,6 +39,8 @@ static void cleanup() {
   }
 }
 
+typedef uint64_t vx_addr_h;
+
 static const char *vx_gemv_kernel = "./kernels/build/gemv.vxbin";
 static vx_buffer_h vx_gemv_buf = NULL;
 
@@ -100,6 +102,25 @@ typedef struct {
     float* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
+
+    // TODO: refactor this to use a more generic way of handling vortex weights
+    vx_addr_h token_embedding_table_vx;
+    vx_addr_h rms_att_weight_vx;
+
+    vx_addr_h wq_vx;
+    vx_addr_h wk_vx;
+    vx_addr_h wv_vx;
+    vx_addr_h wo_vx;
+
+    vx_addr_h rms_ffn_weight_vx;
+
+    vx_addr_h w1_vx;
+    vx_addr_h w2_vx;
+    vx_addr_h w3_vx;
+
+    vx_addr_h rms_final_weight_vx;
+
+    vx_addr_h wcls_vx;
 } TransformerWeights;
 
 typedef struct {
@@ -194,6 +215,52 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
+void memory_map_weights_vx(TransformerWeights *w, Config *p, vx_addr_h ptr,
+                           int shared_weights) {
+  (void)shared_weights;
+  int head_size = p->dim / p->n_heads;
+
+  size_t n_layers = p->n_layers;
+  w->token_embedding_table_vx = ptr;
+
+  ptr += p->vocab_size * p->dim * sizeof(float);
+  w->rms_att_weight_vx = ptr;
+
+  ptr += n_layers * p->dim * sizeof(float);
+  w->wq_vx = ptr;
+
+  ptr += n_layers * p->dim * (p->n_heads * head_size) * sizeof(float);
+  w->wk_vx = ptr;
+
+  ptr += n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float);
+  w->wv_vx = ptr;
+
+  ptr += n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float);
+  w->wo_vx = ptr;
+
+  ptr += n_layers * (p->n_heads * head_size) * p->dim * sizeof(float);
+  w->rms_ffn_weight_vx = ptr;
+
+  ptr += n_layers * p->dim * sizeof(float);
+  w->w1_vx = ptr;
+
+  ptr += n_layers * p->dim * p->hidden_dim * sizeof(float);
+  w->w2_vx = ptr;
+
+  ptr += n_layers * p->hidden_dim * p->dim * sizeof(float);
+  w->w3_vx = ptr;
+
+  ptr += n_layers * p->dim * p->hidden_dim * sizeof(float);
+  w->rms_final_weight_vx = ptr;
+
+  ptr += p->dim * sizeof(float);
+  ptr += p->seq_len * head_size / 2 *
+         sizeof(float); // skip what used to be freq_cis_real (for RoPE)
+  ptr += p->seq_len * head_size / 2 *
+         sizeof(float); // skip what used to be freq_cis_imag (for RoPE)
+  w->wcls_vx = shared_weights ? w->token_embedding_table_vx : ptr;
+}
+
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
@@ -214,6 +281,17 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
+
+    // vortex memory map the Transformer weights
+    size_t weights_size = *file_size - sizeof(Config);
+    vx_buffer_h weights_buf = NULL;
+    vx_addr_h weights_vx_ptr = 0;
+
+    RT_CHECK(
+        vx_mem_alloc(device, weights_size, VX_MEM_READ_WRITE, &weights_buf));
+    RT_CHECK(vx_copy_to_dev(weights_buf, weights_ptr, 0, weights_size));
+    RT_CHECK(vx_mem_address(weights_buf, &weights_vx_ptr));
+    memory_map_weights_vx(weights, config, weights_vx_ptr, shared_weights);
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
@@ -251,7 +329,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
 
 int divUp(int a, int b) { return (a - 1) / b + 1; }
 
-void rmsnorm_vx(float *o, float *x, float *weight, int size) {
+void rmsnorm_vx(float *o, float *x, vx_addr_h weight, int size) {
   vx_buffer_h o_buf = NULL;
   vx_buffer_h x_buf = NULL;
   vx_buffer_h w_buf = NULL;
@@ -273,18 +351,12 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
   RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
   RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
 
-  // weight (size,) size: size * sizeof(float)
-  size_t w_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, w_size, VX_MEM_READ, &w_buf));
-  RT_CHECK(vx_mem_address(w_buf, &args.w_addr));
-
   // Upload x to device
   RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
-  // Upload weight to device
-  RT_CHECK(vx_copy_to_dev(w_buf, weight, 0, w_size));
 
   // Upload kernel arguments
   args.size = size;
+  args.w_addr = weight;
 
   int total_threads = num_warps * num_threads;
   args.elements_per_thread = divUp(size, total_threads);
@@ -401,7 +473,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
-void matmul_vx(float *xout, float *x, float *w, int n, int d) {
+void matmul_vx(float *xout, float *x, vx_addr_h w, int n, int d) {
   vx_buffer_h xout_buf = NULL;
   vx_buffer_h x_buf = NULL;
   vx_buffer_h w_buf = NULL;
@@ -418,19 +490,13 @@ void matmul_vx(float *xout, float *x, float *w, int n, int d) {
   RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
   RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
 
-  // w (d,n) size: d * n * sizeof(float)
-  size_t w_size = d * n * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, w_size, VX_MEM_READ, &w_buf));
-  RT_CHECK(vx_mem_address(w_buf, &args.w_addr));
-
   // Upload x to device
   RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
-  // Upload w to device
-  RT_CHECK(vx_copy_to_dev(w_buf, w, 0, w_size));
 
   // Upload kernel arguments
   args.n = n;
   args.d = d;
+  args.w_addr = w;
 
   vx_buffer_h gemv_args_buffer;
   RT_CHECK(
