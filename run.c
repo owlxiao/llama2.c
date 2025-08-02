@@ -138,6 +138,40 @@ typedef struct {
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+
+    // For vortex
+    vx_buffer_h x_vx_buf;
+    vx_addr_h x_vx;
+
+    vx_buffer_h xb_vx_buf;
+    vx_addr_h xb_vx;
+
+    vx_buffer_h xb2_vx_buf;
+    vx_addr_h xb2_vx;
+
+    vx_buffer_h hb_vx_buf;
+    vx_addr_h hb_vx;
+
+    vx_buffer_h hb2_vx_buf;
+    vx_addr_h hb2_vx;
+
+    vx_buffer_h q_vx_buf;
+    vx_addr_h q_vx;
+
+    vx_addr_h k_vx;
+    vx_addr_h v_vx;
+
+    vx_buffer_h att_vx_buf;
+    vx_addr_h att_vx;
+
+    vx_buffer_h logits_vx_buf;
+    vx_addr_h logits_vx;
+
+    vx_buffer_h key_cache_vx_buf;
+    vx_addr_h key_cache_vx;
+
+    vx_buffer_h value_cache_vx_buf;
+    vx_addr_h value_cache_vx;
 } RunState;
 
 typedef struct {
@@ -169,19 +203,50 @@ void malloc_run_state(RunState* s, Config* p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
+
+#define MALLOC_VORTEX_STATE(name, size)                                        \
+    RT_CHECK(                                                                  \
+        vx_mem_alloc(device, size, VX_MEM_READ_WRITE, &s->name##_vx_buf));     \
+    RT_CHECK(vx_mem_address(s->name##_vx_buf, &s->name##_vx));
+
+    MALLOC_VORTEX_STATE(x, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(xb, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(xb2, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(hb, p->hidden_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(hb2, p->hidden_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(q, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(key_cache,
+                        p->n_layers * p->seq_len * kv_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(value_cache,
+                        p->n_layers * p->seq_len * kv_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(att, p->n_heads * p->seq_len * sizeof(float));
+    MALLOC_VORTEX_STATE(logits, p->vocab_size * sizeof(float));
+
+#undef MALLOC_VORTEX_STATE
 }
 
-void free_run_state(RunState* s) {
-    free(s->x);
-    free(s->xb);
-    free(s->xb2);
-    free(s->hb);
-    free(s->hb2);
-    free(s->q);
-    free(s->att);
-    free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
+void free_run_state(RunState *s) {
+  free(s->x);
+  free(s->xb);
+  free(s->xb2);
+  free(s->hb);
+  free(s->hb2);
+  free(s->q);
+  free(s->att);
+  free(s->logits);
+  free(s->key_cache);
+  free(s->value_cache);
+
+  RT_CHECK(vx_mem_free(s->x_vx_buf));
+  RT_CHECK(vx_mem_free(s->xb_vx_buf));
+  RT_CHECK(vx_mem_free(s->xb2_vx_buf));
+  RT_CHECK(vx_mem_free(s->hb_vx_buf));
+  RT_CHECK(vx_mem_free(s->hb2_vx_buf));
+  RT_CHECK(vx_mem_free(s->q_vx_buf));
+  RT_CHECK(vx_mem_free(s->att_vx_buf));
+  RT_CHECK(vx_mem_free(s->logits_vx_buf));
+  RT_CHECK(vx_mem_free(s->key_cache_vx_buf));
+  RT_CHECK(vx_mem_free(s->value_cache_vx_buf));
 }
 
 void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
@@ -329,10 +394,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
 
 int divUp(int a, int b) { return (a - 1) / b + 1; }
 
-void rmsnorm_vx(float *o, float *x, vx_addr_h weight, int size) {
-  vx_buffer_h o_buf = NULL;
-  vx_buffer_h x_buf = NULL;
-  vx_buffer_h w_buf = NULL;
+void rmsnorm_vx(vx_addr_h o, vx_addr_h x, vx_addr_h weight, int size) {
   rmsnorm_arg_t args = {};
 
   uint64_t num_cores, num_warps, num_threads;
@@ -340,22 +402,10 @@ void rmsnorm_vx(float *o, float *x, vx_addr_h weight, int size) {
   RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
   RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
 
-  // Allocate buffers
-  // o (size,) size: size * sizeof(float)
-  size_t o_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, o_size, VX_MEM_READ_WRITE, &o_buf));
-  RT_CHECK(vx_mem_address(o_buf, &args.o_addr));
-
-  // x (size,) size: size * sizeof(float)
-  size_t x_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
-  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
-
-  // Upload x to device
-  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
-
   // Upload kernel arguments
   args.size = size;
+  args.o_addr = o;
+  args.x_addr = x;
   args.w_addr = weight;
 
   int total_threads = num_warps * num_threads;
@@ -372,13 +422,7 @@ void rmsnorm_vx(float *o, float *x, vx_addr_h weight, int size) {
   RT_CHECK(vx_start(device, vx_rmsnorm_buf, rmsnorm_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(o, o_buf, 0, o_size));
-
   // Free the buffers
-  RT_CHECK(vx_mem_free(o_buf));
-  RT_CHECK(vx_mem_free(x_buf));
-  RT_CHECK(vx_mem_free(w_buf));
   RT_CHECK(vx_mem_free(rmsnorm_args_buffer));
   RT_CHECK(vx_mem_free(vx_rmsnorm_buf));
 }
@@ -473,30 +517,15 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
-void matmul_vx(float *xout, float *x, vx_addr_h w, int n, int d) {
-  vx_buffer_h xout_buf = NULL;
-  vx_buffer_h x_buf = NULL;
-  vx_buffer_h w_buf = NULL;
+void matmul_vx(vx_addr_h xout, vx_addr_h x, vx_addr_h w, int n, int d) {
   gemv_arg_t args = {};
-
-  // Allocate buffers
-  // xout (d,) size: d * sizeof(float)
-  size_t xout_size = d * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, xout_size, VX_MEM_WRITE, &xout_buf));
-  RT_CHECK(vx_mem_address(xout_buf, &args.xout_addr));
-
-  // x (n,) size: n * sizeof(float)
-  size_t x_size = n * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
-  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
-
-  // Upload x to device
-  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
 
   // Upload kernel arguments
   args.n = n;
   args.d = d;
   args.w_addr = w;
+  args.x_addr = x;
+  args.xout_addr = xout;
 
   vx_buffer_h gemv_args_buffer;
   RT_CHECK(
@@ -509,13 +538,7 @@ void matmul_vx(float *xout, float *x, vx_addr_h w, int n, int d) {
   RT_CHECK(vx_start(device, vx_gemv_buf, gemv_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(xout, xout_buf, 0, xout_size));
-
   // Free the buffers
-  RT_CHECK(vx_mem_free(xout_buf));
-  RT_CHECK(vx_mem_free(x_buf));
-  RT_CHECK(vx_mem_free(w_buf));
   RT_CHECK(vx_mem_free(gemv_args_buffer));
   RT_CHECK(vx_mem_free(vx_gemv_buf));
 }
@@ -539,33 +562,17 @@ void rope_encoding(int dim, int kv_dim, int head_size, float pos, float *q,
   }
 }
 
-void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos, float *q,
-                      float *k) {
-  vx_buffer_h q_buf = NULL;
-  vx_buffer_h k_buf = NULL;
+void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos,
+                      vx_addr_h q, vx_addr_h k) {
   rope_arg_t args = {};
-
-  // Allocate buffers
-  // q (dim,) size: dim * sizeof(float)
-  size_t q_size = dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, q_size, VX_MEM_READ_WRITE, &q_buf));
-  RT_CHECK(vx_mem_address(q_buf, &args.q_addr));
-
-  // k (dim,) size: dim * sizeof(float)
-  size_t k_size = dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, k_size, VX_MEM_READ_WRITE, &k_buf));
-  RT_CHECK(vx_mem_address(k_buf, &args.k_addr));
-
-  // Upload q to device
-  RT_CHECK(vx_copy_to_dev(q_buf, q, 0, q_size));
-  // Upload k to device
-  RT_CHECK(vx_copy_to_dev(k_buf, k, 0, k_size));
 
   // Upload kernel arguments
   args.dim = dim;
   args.head_size = head_size;
   args.kv_dim = kv_dim;
   args.pos = pos;
+  args.q_addr = q;
+  args.k_addr = k;
 
   vx_buffer_h rope_args_buffer;
   RT_CHECK(
@@ -578,13 +585,6 @@ void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos, float *q,
   RT_CHECK(vx_start(device, vx_rope_buf, rope_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(q, q_buf, 0, q_size));
-  RT_CHECK(vx_copy_from_dev(k, k_buf, 0, k_size));
-
-  // Free the buffers
-  RT_CHECK(vx_mem_free(q_buf));
-  RT_CHECK(vx_mem_free(k_buf));
   RT_CHECK(vx_mem_free(rope_args_buffer));
   RT_CHECK(vx_mem_free(vx_rope_buf));
 }
@@ -633,61 +633,14 @@ void multihead_attention(float *sxb, float *sq, float *sk, float *sv,
   }
 }
 
-void multihead_attention_vx(float *sxb, float *sq, float *sk, float *sv,
-                            float *satt, float *key_cache, float *value_cache,
-                            int n_heads, int seq_len, int head_size, int kv_dim,
-                            int kv_mul, int pos, int loff) {
-  vx_buffer_h sxb_buf = NULL;
-  vx_buffer_h sq_buf = NULL;
-  vx_buffer_h sk_buf = NULL;
-  vx_buffer_h sv_buf = NULL;
-  vx_buffer_h satt_buf = NULL;
-  vx_buffer_h key_cache_buf = NULL;
-  vx_buffer_h value_cache_buf = NULL;
-  attention_arg_t args = {};
-
-  // Allocate buffers
-  // sxb (dim,) size: n_heads * head_size * sizeof(float)
-  size_t sxb_size = n_heads * head_size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, sxb_size, VX_MEM_READ_WRITE, &sxb_buf));
-  RT_CHECK(vx_mem_address(sxb_buf, &args.sxb_addr));
-
-  // sq (dim,) size: n_heads * head_size * sizeof(float)
-  size_t sq_size = n_heads * head_size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, sq_size, VX_MEM_READ, &sq_buf));
-  RT_CHECK(vx_mem_address(sq_buf, &args.sq_addr));
-
+void multihead_attention_vx(vx_addr_h sxb, vx_addr_h sq, vx_addr_h sk,
+                            vx_addr_h sv, vx_addr_h satt, vx_addr_h key_cache,
+                            vx_addr_h value_cache, int n_heads, int seq_len,
+                            int head_size, int kv_dim, int kv_mul, int pos,
+                            int loff) {
   (void)sk;
   (void)sv;
-
-  // satt (n_heads, seq_len) size: n_heads * seq_len * sizeof(float)
-  size_t satt_size = n_heads * seq_len * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, satt_size, VX_MEM_READ_WRITE, &satt_buf));
-  RT_CHECK(vx_mem_address(satt_buf, &args.satt_addr));
-
-  // key_cache (n_layers, seq_len, kv_dim) size: n_layers * seq_len * kv_dim *
-  // sizeof(float)
-  size_t key_cache_size = n_heads * seq_len * kv_dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, key_cache_size, VX_MEM_READ, &key_cache_buf));
-  RT_CHECK(vx_mem_address(key_cache_buf, &args.key_cache_addr));
-
-  // value_cache (n_layers, seq_len, kv_dim) size: n_layers * seq_len * kv_dim *
-  // sizeof(float)
-  size_t value_cache_size = n_heads * seq_len * kv_dim * sizeof(float);
-  RT_CHECK(
-      vx_mem_alloc(device, value_cache_size, VX_MEM_READ, &value_cache_buf));
-  RT_CHECK(vx_mem_address(value_cache_buf, &args.value_cache_addr));
-
-  // Upload sxb to device
-  RT_CHECK(vx_copy_to_dev(sxb_buf, sxb, 0, sxb_size));
-  // Upload sq to device
-  RT_CHECK(vx_copy_to_dev(sq_buf, sq, 0, sq_size));
-  // Upload satt to device
-  RT_CHECK(vx_copy_to_dev(satt_buf, satt, 0, satt_size));
-  // Upload key_cache to device
-  RT_CHECK(vx_copy_to_dev(key_cache_buf, key_cache, 0, key_cache_size));
-  // Upload value_cache to device
-  RT_CHECK(vx_copy_to_dev(value_cache_buf, value_cache, 0, value_cache_size));
+  attention_arg_t args = {};
 
   // Upload kernel arguments
   args.n_heads = n_heads;
@@ -697,6 +650,11 @@ void multihead_attention_vx(float *sxb, float *sq, float *sk, float *sv,
   args.kv_mul = kv_mul;
   args.pos = pos;
   args.loff = loff;
+  args.sxb_addr = sxb;
+  args.sq_addr = sq;
+  args.satt_addr = satt;
+  args.key_cache_addr = key_cache;
+  args.value_cache_addr = value_cache;
 
   vx_buffer_h attention_args_buffer;
   RT_CHECK(vx_upload_bytes(device, &args, sizeof(attention_arg_t),
@@ -709,15 +667,7 @@ void multihead_attention_vx(float *sxb, float *sq, float *sk, float *sv,
   RT_CHECK(vx_start(device, vx_attention_buf, attention_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(sxb, sxb_buf, 0, sxb_size));
-  
   // Free the buffers
-  RT_CHECK(vx_mem_free(sxb_buf));
-  RT_CHECK(vx_mem_free(sq_buf));
-  RT_CHECK(vx_mem_free(satt_buf));
-  RT_CHECK(vx_mem_free(key_cache_buf));
-  RT_CHECK(vx_mem_free(value_cache_buf));
   RT_CHECK(vx_mem_free(attention_args_buffer));
   RT_CHECK(vx_mem_free(vx_attention_buf));
 }
@@ -729,29 +679,13 @@ void accum(float *a, float *b, int size) {
   }
 }
 
-void accum_vx(float *a, float *b, int size) {
-  vx_buffer_h a_buf = NULL;
-  vx_buffer_h b_buf = NULL;
+void accum_vx(vx_addr_h a, vx_addr_h b, int size) {
   accum_arg_t args = {};
-
-  // Allocate buffers
-  // a (size,) size: size * sizeof(float)
-  size_t a_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, a_size, VX_MEM_READ_WRITE, &a_buf));
-  RT_CHECK(vx_mem_address(a_buf, &args.a_addr));
-
-  // b (size,) size: size * sizeof(float)
-  size_t b_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, b_size, VX_MEM_READ_WRITE, &b_buf));
-  RT_CHECK(vx_mem_address(b_buf, &args.b_addr));
-
-  // Upload b to device
-  RT_CHECK(vx_copy_to_dev(b_buf, b, 0, b_size));
-  // Upload a to device
-  RT_CHECK(vx_copy_to_dev(a_buf, a, 0, a_size));
 
   // Upload kernel arguments
   args.size = size;
+  args.a_addr = a;
+  args.b_addr = b;
 
   vx_buffer_h accum_args_buffer;
   RT_CHECK(
@@ -764,12 +698,6 @@ void accum_vx(float *a, float *b, int size) {
   RT_CHECK(vx_start(device, vx_accum_buf, accum_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(a, a_buf, 0, a_size));
-
-  // Free the buffers
-  RT_CHECK(vx_mem_free(a_buf));
-  RT_CHECK(vx_mem_free(b_buf));
   RT_CHECK(vx_mem_free(accum_args_buffer));
   RT_CHECK(vx_mem_free(vx_accum_buf));
 }
@@ -785,29 +713,13 @@ void swiglu(float *hb, float *hb2, int hidden_dim) {
   }
 }
 
-void swiglu_vx(float *hb, float *hb2, int hidden_dim) {
-  vx_buffer_h hb_buf = NULL;
-  vx_buffer_h hb2_buf = NULL;
+void swiglu_vx(vx_addr_h hb, vx_addr_h hb2, int hidden_dim) {
   swiglu_arg_t args = {};
-
-  // Allocate buffers
-  // hb (hidden_dim,) size: hidden_dim * sizeof(float)
-  size_t hb_size = hidden_dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, hb_size, VX_MEM_READ_WRITE, &hb_buf));
-  RT_CHECK(vx_mem_address(hb_buf, &args.hb_addr));
-
-  // hb2 (hidden_dim,) size: hidden_dim * sizeof(float)
-  size_t hb2_size = hidden_dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, hb2_size, VX_MEM_READ_WRITE, &hb2_buf));
-  RT_CHECK(vx_mem_address(hb2_buf, &args.hb2_addr));
-
-  // Upload hb to device
-  RT_CHECK(vx_copy_to_dev(hb_buf, hb, 0, hb_size));
-  // Upload hb2 to device
-  RT_CHECK(vx_copy_to_dev(hb2_buf, hb2, 0, hb2_size));
 
   // Upload kernel arguments
   args.hidden_dim = hidden_dim;
+  args.hb_addr = hb;
+  args.hb2_addr = hb2;
 
   vx_buffer_h swiglu_args_buffer;
   RT_CHECK(vx_upload_bytes(device, &args, sizeof(swiglu_arg_t),
@@ -820,12 +732,6 @@ void swiglu_vx(float *hb, float *hb2, int hidden_dim) {
   RT_CHECK(vx_start(device, vx_swiglu_buf, swiglu_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(hb, hb_buf, 0, hb_size));
-
-  // Free the buffers
-  RT_CHECK(vx_mem_free(hb_buf));
-  RT_CHECK(vx_mem_free(hb2_buf));
   RT_CHECK(vx_mem_free(swiglu_args_buffer));
   RT_CHECK(vx_mem_free(vx_swiglu_buf));
 }
@@ -844,62 +750,88 @@ float* forward(Transformer* transformer, int token, int pos) {
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
-    float* content_row = w->token_embedding_table + token * dim;
-    memcpy(x, content_row, dim*sizeof(*x));
+    float *content_row = w->token_embedding_table + token * dim;
+
+    vx_buffer_h x_buf = NULL;
+    vx_addr_h x_vx = 0;
+    RT_CHECK(
+        vx_mem_alloc(device, dim * sizeof(float), VX_MEM_READ_WRITE, &x_buf));
+    RT_CHECK(vx_mem_address(x_buf, &x_vx));
+    RT_CHECK(vx_copy_to_dev(x_buf, content_row, 0, dim * sizeof(float)));
 
     // forward all the layers
-    for(unsigned long long l = 0; l < p->n_layers; l++) {
+    for (unsigned long long l = 0; l < p->n_layers; l++) {
 
-        // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+      // attention rmsnorm
+      rmsnorm_vx(s->xb_vx, x_vx, w->rms_att_weight_vx + l * dim * sizeof(float),
+                 dim);
 
-        // key and value point to the kv cache
-        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
-        s->k = s->key_cache + loff + pos * kv_dim;
-        s->v = s->value_cache + loff + pos * kv_dim;
+      // key and value point to the kv cache
+      int loff =
+          l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+      s->k_vx =
+          s->key_cache_vx + loff * sizeof(float) + pos * kv_dim * sizeof(float);
+      s->v_vx = s->value_cache_vx + loff * sizeof(float) +
+                pos * kv_dim * sizeof(float);
 
-        // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+      // qkv matmuls for this position
+      matmul_vx(s->q_vx, s->xb_vx, w->wq_vx + l * dim * dim * sizeof(float),
+                dim, dim);
+      matmul_vx(s->k_vx, s->xb_vx, w->wk_vx + l * dim * kv_dim * sizeof(float),
+                dim, kv_dim);
+      matmul_vx(s->v_vx, s->xb_vx, w->wv_vx + l * dim * kv_dim * sizeof(float),
+                dim, kv_dim);
 
-        // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
+      // RoPE relative positional encoding: complex-valued rotate q and k in
+      // each head
+      rope_encoding_vx(dim, kv_dim, head_size, pos, s->q_vx, s->k_vx);
 
-        // multihead attention. iterate over all heads
-        multihead_attention(s->xb, s->q, s->k, s->v, s->att, s->key_cache,
-                            s->value_cache, p->n_heads, p->seq_len, head_size,
-                            kv_dim, kv_mul, pos, loff);
+      // multihead attention. iterate over all heads
+      multihead_attention_vx(s->xb_vx, s->q_vx, s->k_vx, s->v_vx, s->att_vx,
+                             s->key_cache_vx, s->value_cache_vx, p->n_heads,
+                             p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
 
-        // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+      // final matmul to get the output of the attention
+      matmul_vx(s->xb2_vx, s->xb_vx, w->wo_vx + l * dim * dim * sizeof(float),
+                dim, dim);
 
-        // residual connection back into x
-        accum(x, s->xb2, dim);
+      // residual connection back into x
+      accum_vx(x_vx, s->xb2_vx, dim);
 
-        // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+      // ffn rmsnorm
+      rmsnorm_vx(s->xb_vx, x_vx, w->rms_ffn_weight_vx + l * dim * sizeof(float),
+                 dim);
 
-        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+      // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) *
+      // self.w3(x)) first calculate self.w1(x) and self.w3(x)
+      matmul_vx(s->hb_vx, s->xb_vx,
+                w->w1_vx + l * dim * hidden_dim * sizeof(float), dim,
+                hidden_dim);
+      matmul_vx(s->hb2_vx, s->xb_vx,
+                w->w3_vx + l * dim * hidden_dim * sizeof(float), dim,
+                hidden_dim);
 
-        // SwiGLU non-linearity
-        swiglu(s->hb, s->hb2, hidden_dim);
+      // SwiGLU non-linearity
+      swiglu_vx(s->hb_vx, s->hb2_vx, hidden_dim);
 
-        // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+      // final matmul to get the output of the ffn
+      matmul_vx(s->xb_vx, s->hb_vx,
+                w->w2_vx + l * dim * hidden_dim * sizeof(float), hidden_dim,
+                dim);
 
-        // residual connection
-        accum(x, s->xb, dim);
+      // residual connection
+      accum_vx(x_vx, s->xb_vx, dim);
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
+    rmsnorm_vx(x_vx, x_vx, w->rms_final_weight_vx, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul_vx(s->logits_vx, x_vx, w->wcls_vx, p->dim, p->vocab_size);
+
+    RT_CHECK(vx_copy_from_dev(s->logits, s->logits_vx_buf, 0,
+                              p->vocab_size * sizeof(float)));
+    RT_CHECK(vx_mem_free(x_buf));
     return s->logits;
 }
 
